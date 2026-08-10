@@ -116,14 +116,14 @@ type prelimFlusher interface {
 }
 
 // detached reports whether this type is not (yet) part of a document tree:
-// neither a named root type nor wrapped by an integrated container item.
+// neither a document root type nor wrapped by an integrated container item.
 // Mutations on detached types must be buffered (see prelimFlusher): creating
 // items for them immediately would assign child clocks BELOW the future
 // container item's clock — an ordering genuine Yjs never produces and cannot
 // decode (Item.getMissing skips the missing-struct check for same-client
 // parents, so Y.applyUpdate crashes on such an update). (#yxml-wire)
 func (t *abstractType) detached() bool {
-	return t.item == nil && t.name == ""
+	return t.item == nil && t.doc == nil
 }
 
 // firstLiveFromStart returns the first non-deleted item reachable from t.start

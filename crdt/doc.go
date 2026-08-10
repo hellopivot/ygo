@@ -211,6 +211,20 @@ func (d *Doc) CollectionID() string {
 	return d.collectionID
 }
 
+// RootTypeNames returns the names of the document's shared root types in
+// deterministic order. The empty string is a valid Yjs root type name.
+func (d *Doc) RootTypeNames() []string {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	names := make([]string, 0, len(d.share))
+	for name := range d.share {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
 // Load signals that this subdocument's data should be synced. On a subdocument
 // it sets shouldLoad=true and emits a subdocs "loaded" event on the parent; on a
 // root doc it just sets shouldLoad=true. Safe to call multiple times.
