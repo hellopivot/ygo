@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"time"
 
@@ -106,12 +107,60 @@ var (
 // below simply does nothing) in production.
 var closeDrainHook = func() {}
 
+// postAuthWriteHook runs on the loop goroutine immediately after the Auth token
+// frame has been written and immediately before the SyncStep1 that follows it.
+// That gap is the one point where a test can make the SyncStep1 write fail on
+// purpose, which is the condition that used to let a rejected token reach a
+// second attempt — see auth_writefail_test.go. Always a no-op in production.
+var postAuthWriteHook = func() {}
+
+// preSyncReplyWriteHook runs on the loop goroutine immediately before the
+// SyncStep2 reply that answers a peer's SyncStep1, which is the OTHER write
+// that happens while an auth rejection is still in flight — the client writes
+// it in response to the server's own handshake, so it sits in the same race
+// #238 addressed for the two proactive handshake writes. Parking here lets a
+// test make that write fail on purpose. Always a no-op in production.
+var preSyncReplyWriteHook = func() {}
+
+// dialNetDialContext, when non-nil, replaces gws.Dialer's own network-dial
+// function (see runLoop's dialer construction) for the calling test's
+// duration — the same "package-level indirection purely for test
+// determinism" pattern as closeDrainHook above. Nil in production, which
+// leaves gorilla's own default (plain net.Dial) untouched.
+//
+// It exists because #228/#229 final-review Important B needs a peer whose
+// writes deterministically block past a specific deadline, and this
+// package's own regression tests (see close_test.go's
+// blockingWriteConn/withDialNetDialContext) showed that trying to get there
+// by exhausting a REAL OS socket buffer is not a viable substitute: which of
+// two successive writes overflows first depends on this machine's buffer
+// sizing (observed to vary by roughly an order of magnitude — from
+// comfortably-succeeds to blocks-for-the-full-deadline within one machine's
+// own 640KB-to-800KB window during this package's own test development), and
+// gorilla/websocket caches the FIRST write failure on a connection
+// (writeFatal) and short-circuits every later write with that cached error
+// forever after — so whichever write happens to overflow first "uses up" the
+// only failure this connection will ever produce, making the SECOND write's
+// own deadline unobservable. A test-controlled net.Conn sidesteps both
+// problems: it blocks exactly the write it is told to, for exactly the
+// deadline that write's caller supplies, regardless of any real socket's
+// buffer state.
+var dialNetDialContext func(ctx context.Context, network, addr string) (net.Conn, error)
+
 // reconnectBackoffBase is the Full Jitter base duration runReconnectLoop
 // constructs its backoff with. Unlike MaxBackoff, this is not an Options
 // field: #165 has no requirement to tune the SHORT end of the schedule, and
 // letting only the ceiling be configurable is one fewer number an embedder
 // can get wrong for no real benefit.
 const reconnectBackoffBase = 500 * time.Millisecond
+
+// handshakeRejectionDrainTimeout bounds how long classifyWriteErr waits for the
+// read pump to hand over whatever the peer managed to send before a write
+// failed. Short on purpose: the data it is looking for was already in the
+// receive buffer before the write failed, so this never waits on the network in
+// the case it exists to serve — the bound only limits how long an unrelated
+// failure can delay a legitimate reconnect.
+const handshakeRejectionDrainTimeout = 250 * time.Millisecond
 
 // readDeadlineMultiplier is how many Options.PingInterval periods of total
 // silence (no pong, no data frame — see runLoop's keepalive section) this
@@ -120,8 +169,14 @@ const reconnectBackoffBase = 500 * time.Millisecond
 // either side) is not by itself fatal — the NEXT ping still has a full
 // interval to succeed before the deadline expires — while two consecutive
 // misses fires well before an embedding application would notice anything
-// wrong on its own. This mirrors y-websocket's own ping-every-30s,
-// terminate-at-2x convention (#165).
+// wrong on its own. The 30s/2x pairing is chosen to match the
+// WIDELY-DOCUMENTED y-websocket convention (ping every 30s, terminate after
+// 2 missed intervals) as a reasonable interoperability default (#165). This
+// repo does not vendor or otherwise check against y-websocket's actual JS
+// source, so read that as "chosen to be compatible with," not
+// "independently verified against," that implementation (#228: an earlier
+// version of this doc cited the convention as an established fact this repo
+// had confirmed, which it cannot).
 const readDeadlineMultiplier = 2
 
 // session is one connection's worth of loop state: the socket, and whatever
@@ -188,6 +243,19 @@ type session struct {
 	// HANDSHAKE, not merely a successful dial" (see backoff.reset's doc)
 	// actually happen at the one moment that is true.
 	onSynced func()
+	// frames and readErr are the READ PUMP's channels (runLoop starts the
+	// pump before the handshake writes). classifyWriteErr consults them
+	// rather than reading the connection itself: gorilla requires that no
+	// more than one goroutine call the read methods, and the pump is that
+	// goroutine for this connection's whole life. Reading the socket
+	// directly here — as the original #238 fix did — races the pump for the
+	// very frame it is looking for, so whichever loses sees nothing.
+	//
+	// Consuming from them inside a frame handler is safe: handlers run FROM
+	// runLoop's own select, so runLoop is never selecting on them at the
+	// same time. There is exactly one consumer at any moment.
+	frames  <-chan []byte
+	readErr <-chan error
 }
 
 // runLoop performs one full connection lifecycle: dial, y-websocket
@@ -260,15 +328,31 @@ func (c *Client) runLoop(ctx context.Context, onSynced func()) error {
 	dialer := &gws.Dialer{
 		Proxy:            http.ProxyFromEnvironment,
 		HandshakeTimeout: dialHandshakeTimeout,
+		// Always nil in production (see dialNetDialContext's own doc), which
+		// is exactly gorilla's own "NetDialContext nil -> plain net.Dial"
+		// default — this field's mere presence changes nothing here.
+		NetDialContext: dialNetDialContext,
 	}
 	// c.opts.Header was defensively copied by New, so a caller mutating their
 	// own map after construction cannot change what this dial sends.
 	conn, resp, err := dialer.DialContext(ctx, c.opts.URL, c.opts.Header)
 	if resp != nil && resp.Body != nil {
 		// gorilla hands back the HTTP response on a rejected upgrade (e.g. a
-		// 401 from provider/websocket's Authorize hook). Nothing here reads
-		// it, but leaving it open would leak the connection out of the
-		// transport's pool.
+		// 401 from provider/websocket's Authorize hook). By this point
+		// resp.Body is NOT a connection checked out of an http.Transport's
+		// pool — there is no net/http.Transport in a WebSocket dial at all;
+		// gorilla's Dialer opens and owns the raw net.Conn itself, and on
+		// any failed handshake it substitutes resp.Body with an in-memory
+		// io.NopCloser wrapping a short diagnostic read-ahead buffer, having
+		// already closed the real network connection in its own deferred
+		// cleanup before this line ever runs (see gorilla's client.go: the
+		// dial's own `defer` closes netConn unless the handshake fully
+		// succeeded). Closing it here is therefore just tidying up an
+		// already-inert NopCloser — harmless, and the idiomatic "always
+		// close what you were handed" habit — not a fix for an actual
+		// connection or socket leak (#228: an earlier version of this
+		// comment blamed "the transport's pool", which doesn't exist on
+		// this path).
 		_ = resp.Body.Close()
 	}
 	if err != nil {
@@ -357,19 +441,77 @@ func (c *Client) runLoop(ctx context.Context, onSynced func()) error {
 			}
 		}
 	}()
-	// Tear down in the order that actually unblocks the pump: cancel releases
-	// a pump parked on the frames send, Close releases one parked in
-	// ReadMessage, and only then is it safe to wait. Joining the goroutine
-	// (rather than letting it drift) is what keeps `go test -race` from
-	// attributing a later connection's activity to a leaked pump, and what
-	// makes "no goroutine outlives Connect" checkable.
+	// Tear down in the order that actually unblocks the pump: send a
+	// WebSocket-level close frame FIRST (#228), then cancel releases a pump
+	// parked on the frames send, Close releases one parked in ReadMessage,
+	// and only then is it safe to wait. Joining the goroutine (rather than
+	// letting it drift) is what keeps `go test -race` from attributing a
+	// later connection's activity to a leaked pump, and what makes "no
+	// goroutine outlives Connect" checkable.
+	//
+	// # Why the close frame (#228)
+	//
+	// Without it, every exit from this function — including the ordinary
+	// "Close was called" case — looked identical, from the PEER's side, to
+	// this connection simply vanishing: conn.Close() below only tears down
+	// the local TCP socket, it does not tell the other end anything.
+	// ygo's own server (and any other implementation of the ordinary
+	// WebSocket close handshake) logs that as an abnormal closure (code
+	// 1006) and has no way to distinguish it from a crash, a network
+	// partition, or a hung process — even though this client, on the
+	// ordinary Close path, knows perfectly well that it is leaving on
+	// purpose. Sending CloseNormalClosure here first — the same thing a
+	// graceful gorilla/websocket client is documented to do before dropping
+	// its connection — makes the peer's ReadMessage return a proper
+	// *websocket.CloseError instead of a bare I/O error, which is what lets
+	// its disconnect handling log (and act on) a clean close rather than an
+	// abnormal one. See TestClient_Close_SendsWebSocketCloseFrame (close_test.go)
+	// for the proof, observed server-side on a raw WebSocket peer rather
+	// than inferred from this comment.
+	//
+	// This defer fires on EVERY exit from runLoop, not only the deliberate
+	// Close one — a rejected-auth exit and a read-error exit send the exact
+	// same CloseNormalClosure code, because the alternative (threading a
+	// more accurate code through every return path above) buys little: the
+	// peer's read loop has usually already seen — or is about to see — its
+	// own error from whatever actually went wrong (a dropped connection, an
+	// unauthorized close code it sent itself), so CloseNormalClosure here is
+	// read as "this side is done writing," not as a claim about why. Treat
+	// the CODE this frame carries as exactly that and nothing more (#229/#228
+	// final whole-branch review, Important E).
+	//
+	// WriteControl, not writeWithDeadline/WriteMessage: this runs on the
+	// loop goroutine, the same one every DATA frame write already runs on
+	// (see session's single-writer doc), so nothing else could be mid-write
+	// here regardless — but WriteControl is what every other control frame
+	// this file sends (session.ping) already uses, and matching that
+	// convention costs nothing. The error is deliberately ignored: on every
+	// path that reaches this defer except the clean ctx-cancelled one, the
+	// connection is already failing or already gone, so a failed close
+	// write here reveals nothing conn.Close() below doesn't already make
+	// moot; on the clean path, a failure here just means the peer (or the
+	// network) tore the socket down first, which conn.Close() handles the
+	// same way regardless of why.
+	//
+	// closeDrainTimeout, not writeTimeout: this write runs strictly AFTER
+	// the ctx.Done() case's own flushLane(ctx, closeDrainTimeout) drain (see
+	// that var's doc for why 2s, not the 10s handshake-path writeTimeout,
+	// backs a write this late) — and Client.Close joins this goroutine
+	// before returning, so using writeTimeout here let a backpressured but
+	// still-alive peer add up to 10s to Close's return latency where the
+	// drain immediately above it was already bounded at 2s (#229/#228 final
+	// whole-branch review, Important B; see
+	// TestClient_Close_CloseFrameUsesCloseDrainTimeoutNotWriteTimeout).
 	defer func() {
+		_ = conn.WriteControl(gws.CloseMessage,
+			gws.FormatCloseMessage(gws.CloseNormalClosure, ""),
+			time.Now().Add(closeDrainTimeout))
 		connCancel()
 		_ = conn.Close()
 		<-readerDone
 	}()
 
-	s := &session{c: c, conn: conn, onSynced: onSynced}
+	s := &session{c: c, conn: conn, onSynced: onSynced, frames: frames, readErr: readErr}
 	c.emitStatus(Status{State: StateConnected})
 
 	// #165 Task 8: whatever this connection's Awareness view learned about
@@ -429,8 +571,9 @@ func (c *Client) runLoop(ctx context.Context, onSynced func()) error {
 	// comment.
 	if c.opts.Token != "" {
 		if err := s.write(encodeAuthToken(c.opts.Token)); err != nil {
-			return fmt.Errorf("client: send auth token: %w", err)
+			return s.classifyWriteErr(fmt.Errorf("client: send auth token: %w", err))
 		}
+		postAuthWriteHook()
 	}
 
 	// Open with our state vector, so the server can send back exactly what
@@ -441,7 +584,7 @@ func (c *Client) runLoop(ctx context.Context, onSynced func()) error {
 	// anyway is what makes this client correct against a y-websocket server
 	// that DOES wait — and it costs one state vector.
 	if err := s.write(encodeEnvelope(wireMsgSync, ygsync.EncodeSyncStep1(c.opts.Doc))); err != nil {
-		return fmt.Errorf("client: send sync step 1: %w", err)
+		return s.classifyWriteErr(fmt.Errorf("client: send sync step 1: %w", err))
 	}
 
 	for {
@@ -641,6 +784,73 @@ func (c *Client) runReconnectLoop(ctx context.Context) error {
 	}
 }
 
+// classifyWriteErr upgrades ANY write failure on this session to
+// ErrAuthRejected when the server had already rejected this connection's token
+// and the rejection has been delivered by the read pump.
+//
+// Both auth-rejection detectors live on the READ path — the PermissionDenied
+// data frame (handleFrame's wireMsgAuth case) and the 4401 close code
+// (runLoop's readErr case). A failed write makes the loop return before either
+// is consumed, so without this the failure surfaces as an ordinary retryable
+// I/O error and runReconnectLoop dials again with a token the server has
+// already refused, breaking the "reported once, never retried" guarantee
+// ErrAuthRejected's doc makes.
+//
+// Applying at EVERY write site is the correction to #238. That fix covered
+// only the two PROACTIVE handshake writes (the Auth frame and SyncStep1), but
+// the client also writes in RESPONSE to the server's handshake: answering the
+// server's SyncStep1 with a SyncStep2 reply is a write in the same race, and
+// it is the one that kept TestClient_Auth_WrongTokenIsTerminal failing at
+// authCalls=2 after #238 — reproduced on run 46 of 400, reporting
+// "send sync step 2 reply: ... write: broken pipe". Classifying in ONE place
+// that all of them reach is what stops the next write site from reintroducing
+// it.
+//
+// It consults the read pump rather than reading the connection, because
+// gorilla permits only one goroutine in the read methods and the pump already
+// is that goroutine — see the frames/readErr fields' own doc.
+//
+// Kept narrow, so ordinary network failures still retry:
+//
+//   - only when Options.Token is set: a connection that never sent a token
+//     cannot be having ITS token rejected.
+//   - only before this session is synced: a completed handshake proves the
+//     token was accepted, so no rejection can still be in flight and a
+//     mid-session write failure is an ordinary retryable one.
+//   - bounded by handshakeRejectionDrainTimeout, returning the original error
+//     unchanged when no rejection turns up.
+func (s *session) classifyWriteErr(writeErr error) error {
+	if s.c.opts.Token == "" || s.synced {
+		return writeErr
+	}
+	deadline := time.NewTimer(handshakeRejectionDrainTimeout)
+	defer deadline.Stop()
+	for {
+		select {
+		case err := <-s.readErr:
+			// The close frame carries the rejection just as well as the data
+			// frame does, and survives an abrupt reset that truncates the
+			// payload — the same reasoning runLoop's readErr case documents.
+			if gws.IsCloseError(err, wsCodeUnauthorized) {
+				return fmt.Errorf("client: %w (via close code, after a write failed): %w",
+					ErrAuthRejected, writeErr)
+			}
+			return writeErr
+		case payload := <-s.frames:
+			mt, body, derr := decodeEnvelope(payload)
+			if derr != nil || mt != wireMsgAuth {
+				continue // not the frame we are looking for; keep looking
+			}
+			subType, reason, derr := decodeAuthReply(body)
+			if derr == nil && subType == authTypePermissionDenied {
+				return fmt.Errorf("client: %w: %s", ErrAuthRejected, reason)
+			}
+		case <-deadline.C:
+			return writeErr
+		}
+	}
+}
+
 // write emits one already-framed control/handshake-path message (SyncStep1,
 // the auth token, a SyncStep1 reply, a query-awareness reply) using the
 // fixed writeTimeout const. Only ever called from the loop goroutine (see
@@ -707,8 +917,9 @@ func (s *session) handleFrame(frame []byte) error {
 			// The peer sent SyncStep1; reply is our SyncStep2 for it. This is
 			// how our own offline edits reach the server: the server asks
 			// what we have, and this answer carries everything it is missing.
+			preSyncReplyWriteHook()
 			if err := s.write(encodeEnvelope(wireMsgSync, reply)); err != nil {
-				return fmt.Errorf("client: send sync step 2 reply: %w", err)
+				return s.classifyWriteErr(fmt.Errorf("client: send sync step 2 reply: %w", err))
 			}
 		}
 		if subErr == nil && subType == ygsync.MsgSyncStep2 && !s.synced {
@@ -734,10 +945,19 @@ func (s *session) handleFrame(frame []byte) error {
 			// shared Awareness sees it at the moment handleDisconnect
 			// runs — unbumped. Against our own server, a SINGLE Heartbeat
 			// here already clears that removal unconditionally: Heartbeat's
-			// own +1 (from our pre-disconnect clock — this client's OWN
-			// local clock is untouched by a removal broadcast, since a
-			// disconnecting peer never receives its own removal notice)
-			// makes our re-announcement strictly NEWER than any removal our
+			// own +1 (from our pre-disconnect clock — under the ORDINARY
+			// interleaving this client's OWN local clock is untouched by a
+			// removal broadcast, because the disconnecting connection is
+			// already torn down by the time handleDisconnect's broadcast
+			// fires, so there is no live socket of ours left to receive it
+			// on. That is not a universal rule, though (#228: an earlier
+			// version of this comment stated it as one): that broadcast's
+			// excludeSelf is false — see peer.go's
+			// broadcastAwarenessFromRoom — so a peer that has already
+			// RECONNECTED under the SAME clientID before the broadcast
+			// fires, a genuine race rather than the ordinary case, IS a
+			// live recipient of its own removal notice) makes our
+			// re-announcement strictly NEWER than any removal our
 			// server could have synthesised from that same base, so
 			// Awareness.ApplyUpdate's ordinary newer-clock path — not the
 			// equal-clock one — admits it every time, regardless of
@@ -853,7 +1073,7 @@ func (s *session) handleFrame(frame []byte) error {
 			enc.WriteVarBytes(s.c.awareness.EncodeUpdate([]uint64{s.c.awareness.ClientID()}))
 		}))
 		if err := s.write(reply); err != nil {
-			return fmt.Errorf("client: send awareness query reply: %w", err)
+			return s.classifyWriteErr(fmt.Errorf("client: send awareness query reply: %w", err))
 		}
 	}
 	return nil
@@ -1031,7 +1251,13 @@ func (s *session) flushLane(ctx context.Context, deadline time.Duration) error {
 				giveUp = true
 				continue
 			}
-			return fmt.Errorf("client: %s: %w", what, err)
+			// Classified for the same reason as every other write site: a
+			// local edit queued while the handshake is still in flight is
+			// flushed from runLoop's lane-signal case, so this write can be
+			// the one that loses the race with a token rejection. Both
+			// callers are on the loop goroutine, so consulting the read
+			// pump here is single-consumer, as classifyWriteErr requires.
+			return s.classifyWriteErr(fmt.Errorf("client: %s: %w", what, err))
 		}
 	}
 }

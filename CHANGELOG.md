@@ -5,6 +5,424 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.49.5] — 2026-09-02
+
+### Fixed
+
+- **`provider/client`: a rejected auth token could still reach a second
+  attempt.** v1.49.3 (#238) taught the two PROACTIVE handshake writes — the
+  Auth frame and SyncStep1 — to recognise a rejection that was already sitting
+  unread when the write failed. But the client also writes in RESPONSE to the
+  server's handshake: reading the server's own SyncStep1 makes it answer with a
+  SyncStep2 reply, and that write is in the same race. When the rejection won
+  it, the reply write failed with EPIPE, surfaced as an ordinary retryable I/O
+  error, and `runReconnectLoop` dialled again with a token the server had
+  already refused.
+
+  Two of the session's FIVE write sites were covered; the SyncStep2 reply, the
+  awareness-query reply, and `flushLane`'s own write (which sends a local edit
+  queued while the handshake is still in flight) were not. The classification
+  now happens in a single place that every write site reaches.
+
+  A source-level guard, `TestUnit_EveryWriteSiteClassifiesAuthRejection`, now
+  asserts that every error-checked connection write routes through it. This bug
+  reached `main` twice by the same mechanism — a write site nobody had written
+  a behavioural test for — and a behavioural test can only ever cover the sites
+  someone thought of. The guard caught the `flushLane` site during this very
+  change, after it had already been missed once.
+
+  The fix also removes a latent contract violation introduced with #238's:
+  `classifyHandshakeWriteErr` called `ReadMessage` on the connection while the
+  read-pump goroutine was also in `ReadMessage`, which gorilla explicitly
+  forbids ("no more than one goroutine calls the read methods"). That is also
+  why it was unreliable — the pump and the classifier raced for the very frame
+  the classifier was looking for, so whichever lost saw nothing.
+  `classifyWriteErr` instead consults the pump's existing channels, which is
+  race-free: frame handlers run from `runLoop`'s own select, so there is
+  exactly one consumer at any moment.
+
+  Impact is unchanged from #238 and still limited: the connection terminated
+  correctly with `ErrAuthRejected`, so there was never an infinite retry, hang,
+  or data loss. A rejected client made two authentication attempts instead of
+  one, which matters where a server counts auth failures for rate-limiting or
+  lockout.
+
+  Present since v1.48.0, and only narrowed by v1.49.3. It kept failing
+  `TestClient_Auth_WrongTokenIsTerminal` intermittently on `main` after that
+  release — reproduced here at `authCalls=2` on run 46 of 400, reporting
+  `send sync step 2 reply: ... write: broken pipe`. The new
+  `TestClient_Auth_RejectionSurvivesSyncReplyWriteFailure` forces that timing
+  deterministically. Mutation-checked in both directions: unguarding the reply
+  site fails only the new test while #238's still passes, and unguarding the
+  proactive writes fails only #238's — so the earlier test structurally could
+  not have caught this (#240 follow-up).
+## [1.49.4] — 2026-09-02
+
+### Fixed
+
+- **`provider/websocket`: a failing `MemoryPersistence` fold was retried on every
+  write.** The adapter folds a room once it has accumulated `CompactEvery`
+  un-folded records, and the ledger's progress mark advances only on success —
+  deliberately, so records cannot pile up unnoticed behind a fold that never
+  runs. But the trigger compares the outstanding count against a fixed
+  threshold, and a failed fold leaves that count above the threshold, so the
+  fold was re-attempted on *every* subsequent write rather than once per
+  `CompactEvery` writes.
+
+  Each retry pays a full merge over a log the failed retry could not shrink, so
+  the cost is quadratic in the write count. Measured with `CompactEvery=10` and a
+  fold that fails after doing its read+merge: 800 writes cost 791 attempts and
+  320,355 merged records before, 7 attempts and 1,270 merged records after — the
+  gap widens with scale (33× fewer merged records at 100 writes, 252× at 800).
+
+  The automatic trigger now backs off: each consecutive failure doubles the
+  number of writes before the next attempt, capped at 64× the base cadence, and
+  the first success resets it. The cap is deliberate — a fold that never runs is
+  a log that never shrinks, so the retries have to continue and the un-folded
+  backlog has to stay bounded. Backing off in units of writes rather than
+  wall-clock keeps a quiet room from spinning and lets a recovered store be
+  retried on its next writes instead of after a sleep unrelated to its load.
+
+  This is safe precisely because a failed fold is not a durability event: the
+  updates are already stored, and an un-folded record is still a stored record.
+  The reasoning does not transfer to the store path.
+
+  Backoff governs only the automatic trigger. An explicit `Compact` call,
+  `LoadDoc`, and the server's `CompactableAdapter` path all still fold on
+  demand; `Server.CompactEvery` has its own damping and was never affected.
+
+  Present since v1.49.0 (#239).
+
+### Changed
+
+- **`modernc.org/sqlite` v1.34.5 → v1.39.0** (with `modernc.org/libc`,
+  `mathutil` and `memory` pulled along). Five minor versions of upstream fixes
+  for the pure-Go SQLite driver behind `persistence/sqlite` and
+  `provider/client`'s local store.
+
+  v1.39.0 is the ceiling, not the latest: v1.39.1 requires Go 1.24 and the
+  current v1.57.0 requires Go 1.25, while this module's floor is Go 1.23. Going
+  further means raising that floor, which is a breaking change for consumers and
+  a separate decision — see `.github/dependabot.yml`, where gomod version
+  updates are disabled for exactly this reason (security updates still flow).
+  The `go` directive normalises from `1.23` to `1.23.0`; the floor is unchanged
+  and no `toolchain` directive is introduced.
+
+## [1.49.3] — 2026-09-01
+
+### Fixed
+
+- **`provider/client`: a rejected auth token could be retried.** `Options.Token`
+  is documented as terminal — a server that refuses the token is reported once,
+  never retried — and `runReconnectLoop` enforces that by returning on
+  `ErrAuthRejected` before its backoff sleep. But both detectors for a rejection
+  live on the READ path: the `PermissionDenied` data frame and the 4401 close
+  code. The client writes the Auth frame and then immediately writes SyncStep1
+  without waiting for a reply, so when the server's rejection and close won that
+  race the SyncStep1 *write* failed, the read loop was never entered, and the
+  failure surfaced as an ordinary retryable I/O error. The reconnect loop then
+  dialled again with a token the server had already refused.
+
+  The rejection was not actually lost when this happened — data the peer sent
+  before closing stays readable even after the local write fails with `EPIPE` —
+  so the client was discarding evidence it already had. A handshake write
+  failure now drains the read side, bounded by 250ms and gated on
+  `Options.Token` being set, and reports `ErrAuthRejected` when it finds the
+  rejection in either form.
+
+  Present since v1.48.0. Observed as intermittent CI failures of
+  `TestClient_Auth_WrongTokenIsTerminal` with `authCalls=2` on v1.49.0's and
+  v1.49.2's `main` runs; that test could not reproduce it on demand, so the new
+  `TestClient_Auth_RejectionSurvivesHandshakeWriteFailure` forces the condition
+  deterministically with a test hook between the two handshake writes.
+
+  Impact is limited: the connection still terminates correctly with
+  `ErrAuthRejected`, so there was never an infinite retry, a hang, or data loss.
+  A rejected client made two authentication attempts instead of one, which
+  matters where a server counts auth failures for rate-limiting or lockout.
+
+## [1.49.2] — 2026-09-01
+
+### Fixed
+
+- **Benchmarks: the observed-transaction benchmark could not measure what it
+  claimed.** Test-only; no library source changed in this release. Three
+  separate flaws made the #180 suite agree with the performance claims in #189
+  instead of testing them, which let one claim survive review and
+  implementation before measurement showed it was backwards.
+  - The pre-existing `BenchmarkObservedTxn_Apply` is blind by construction: a
+    single client appending merges into a handful of `ContentString` items, so
+    its observer walk is O(items) and effectively O(1) however many characters
+    the document holds.
+  - Its replacement measured a document that grew while being measured. Every
+    iteration inserts, and Go picks `b.N` by timing progressively larger runs,
+    so the reported ns/op tracked `b.N` rather than the size named in the
+    sub-benchmark. `n=1000/observed` reported 114,392 ns/op before the fix and
+    ~7,300 ns/op after: roughly 16x of the original figure was artifact. The
+    document is now rebuilt, with the timer stopped, once it drifts 2% past
+    `n`.
+  - The fixture was O(n^2) — two encode+apply round trips per character, so 4k
+    characters took 60ms and larger sizes were untestable. It is now linear:
+    50k builds in 103ms.
+- **Benchmarks: `BenchmarkDeleteSet_IsDeleted` sampled the wrong range
+  counts.** It covered 1/10/100/1000 and skipped 0, 2, 4, 8 and 16. A
+  transaction's delete set holds one range per distinct deleted region, so
+  ordinary editing produces 0 or 1 and a pure insert produces an empty set —
+  the omitted region is where every real workload sits. `computeDelta` calls
+  `IsDeleted` once per pre-existing item, so sub-nanosecond differences there
+  are multiplied by the document's item count on every observed transaction.
+
+See #189 for the measurements this produced, including one proposed
+optimisation that was implemented, reviewed, measured, and rejected.
+
+## [1.49.1] — 2026-08-25
+
+### Fixed
+
+- **`crdt`: `ApplyUpdateV2` silently dropped document content when the update
+  contained GC structs.** The V2 client-group loop short-circuited `case 0`
+  (GC): it recorded the collected range in the transaction's delete set, then
+  advanced `clock` and `continue`d. Nothing was appended to the store for that
+  range and the group's `existingEnd` watermark never moved, so the client's
+  struct list had a hole in it. Every subsequent struct from that client then
+  tripped the same-client clock-gap check and was parked in `store.pending`
+  with a `missing` watermark that could never be satisfied, because the
+  predecessor it was waiting for had arrived in this same self-contained
+  update. `ApplyUpdateV2` returned `nil` throughout, so callers saw success
+  and a quietly smaller document. Because origins are cross-client, one
+  stalled client cascaded: items in other clients whose `origin` pointed into
+  the stalled range stalled behind it. Measured on 94 real documents written
+  by `yrs`: `yjs@13.6.32` read 974 nodes and 951 edges, ygo read 535 and 451,
+  and 63 of the 94 documents came out wrong — the largest losing 45 of 46 map
+  entries. The V1 decoder has always been correct here, and its comment names
+  this exact failure ("track progress so subsequent items in the group are not
+  falsely gapped"): it decodes a GC struct into a placeholder `Item`
+  (`ContentDeleted`, `Deleted: true`, no parent) and runs it through the same
+  clock-accounting, park and offset logic as every other struct, appending it
+  to the store via the `Parent == nil && Deleted` branch. The V2 path now does
+  the same, so a GC struct occupies its clock range instead of leaving a hole.
+  The delete-set entry is retained alongside it, so already-held items in the
+  range are still tombstoned and never-seen ranges still park in `pendingDs`.
+  Reproducible with `yjs` alone — no `yrs` involved — with a two-peer document
+  that deletes nested shared types (#231).
+
+- **`crdt`: `tryIntegrate` appended a partially-overlapping GC placeholder
+  untrimmed.** Both decode loops trim a GC placeholder to its not-yet-integrated
+  suffix before `store.Append` (offset + `Content.Splice`), but the pending-queue
+  retry did not. A GC placeholder parked for a same-client clock gap can be
+  retried after the store's clock for that client has advanced INTO — but not
+  through — its range, and the retry then appended the original item, leaving two
+  structs covering the same clocks in a per-client list that `Append` and the
+  state vector both assume is contiguous and ordered. Pre-existing on the V1
+  path; the V2 GC fix above makes it reachable from V2 as well, since GC structs
+  now become items that can enter the pending queue at all.
+
+### Added
+
+- **`crdt/testdata/gc_yjs_fixtures.json` and
+  `testutil/gen_fixtures_gc.js`: conformance fixtures whose updates contain GC
+  structs.** Every other fixture file here is built from a single-client
+  document with no deletion history, so **not one of the 202 pre-existing V2
+  fixtures carried a single GC struct** — verified by decoding all of them with
+  `Y.decodeUpdateV2` and classifying each struct. That is why #231 shipped: the
+  V2 GC branch had no external-encoder coverage at all. The two existing
+  GC-specific tests (`gc_container_parent_test.go`,
+  `gc_container_attr_misgraft_test.go`) do exercise V2, but they encode with
+  `EncodeStateAsUpdateV2`, and a self round-trip cannot catch a decoder that
+  disagrees with an external encoder. The only tests that hand-built a GC
+  struct onto the wire fed it through `ApplyUpdateV1`.
+
+  Three scenarios (map, array, XML fragment), each two-peer with real
+  deletions, carrying 30, 12 and 8 GC structs. Two peers matters: a
+  single-client document produces no cross-client origins, and it was the
+  cascade through those origins that turned #231 from a lost item into a lost
+  document. The generator asserts every row still contains GC structs, and
+  `TestConformance_GCFixtures_ActuallyContainGCStructs` asserts it again on the
+  Go side, so a future yjs GC-heuristic change cannot silently empty this
+  coverage back out to plain Items. Worth recording for anyone extending the
+  file: deleting **plain values** never produces a GC struct — yjs only
+  substitutes a placeholder once the deleted item's *parent* has been
+  collected, so the deleted content has to be a nested shared type. Measured
+  while writing this: deleting nested `Y.Map`s from a map or an array, or
+  `Y.XmlElement`s from a fragment, yields one GC struct each; deleting a run of
+  plain array values or a span of `YText` yields zero (#232).
+
+## [1.49.0] — 2026-08-21
+
+### Added
+
+- **`provider/websocket`: `MemoryPersistence.Compact` and a `CompactEvery`
+  field.** `Compact(ctx, room)` folds a room's appended update log into one
+  blob on demand, satisfying the optional `CompactableAdapter` interface so
+  `Server.CompactEvery` and on-unload compaction apply to this adapter too —
+  additively, on top of the threshold below. `CompactEvery int` bounds how
+  many appended updates a room accumulates before `MemoryPersistence` folds
+  itself, independent of whether the caller ever sets `Server.CompactEvery`;
+  0 or less means the default of 500, matching `provider/client`'s own
+  compaction default. `MemoryPersistence` deliberately does **not** implement
+  `PersistenceAdapterContext`: an in-memory append has nothing to abort, and
+  implementing it anyway newly satisfies that interface, switching the
+  server's persistence worker onto its cancellable-ctx path — where the
+  coalescing-disabled path's final shutdown drain reuses a ctx a separate
+  goroutine cancels concurrently, discarding a still-queued committed write
+  with only a log line. Measured: 51-151 of 200 concurrent writes dropped
+  across trials when this was tried during development, attributable to this
+  method. (The separate, pre-existing gap in the coalescing-disabled shutdown
+  drain — it drains its queue once and exits, regardless of adapter — also
+  drops writes under this same repro shape. It was filed as #229 and is fixed
+  in this same release, below; it is not what this method's removal fixes.)
+
+### Fixed
+
+- **`provider/websocket`: `MemoryPersistence.StoreUpdate` re-merged the whole
+  document on every write.** Each call ran
+  `crdt.MergeUpdatesV1(existing, update)` against the room's full accumulated
+  state, so one incremental write cost O(document) and a session of N writes
+  cost O(document²) overall — exactly the shape `PersistenceAdapter`'s own doc
+  warns adapters against. `MemoryPersistence` now delegates to
+  `persistence.MemoryPersistence` + `persistence.LegacyAdapter`
+  (`KeepVersions = 1`): each write **appends** the update (O(update)), and the
+  room folds its own backlog into one blob every `CompactEvery` writes, so the
+  O(document) cost is paid once per `CompactEvery` writes rather than on every
+  one. Measured per-write cost, old merge-on-write vs. new
+  append-then-compact: ~9.6× faster at 100 updates already in the room
+  (13,975ns → 1,457ns), ~77.7× at 1,000 (132,871ns → 1,710ns), ~360× at 10,000
+  (1,676,329ns → 4,653ns). Read literally, #186's acceptance criterion ("flush
+  cost no longer grows with doc size") is **not fully met**: the growth
+  constant is divided by `CompactEvery` (500 by default), not eliminated —
+  per-write cost is still `append + O(document)/CompactEvery`, so it keeps
+  growing with document size, just far more slowly. Flat, constant-time
+  writes are not achievable for this storage model, since `LoadDoc` must
+  still return the room as one V1 blob. The trade this makes explicit:
+  `LoadDoc` is no longer O(1) — it now folds whatever records the room still
+  holds (bounded by `CompactEvery`) and persists that fold, so subsequent
+  loads are cheap again (#186).
+- **`provider/websocket`: transactions committed during `Shutdown` were
+  silently dropped by the persistence worker.** The worker's shutdown exit
+  drained `r.persistCh` **once** and returned, but its producer —
+  `doc.OnUpdate` — watched only the room-teardown signal, never
+  `shutdownCh`. `Shutdown` closes `shutdownCh` as its first act and the peer
+  connections much later, so peer read loops kept committing for the whole
+  close-and-join window; everything they committed after that one-shot sweep
+  landed in the 256-slot buffer with no reader and was lost without even a
+  log line — while the package documented the opposite guarantee. Affected
+  the **default** configuration and every adapter. Same class as the
+  relay-side #202. The worker now publishes its retirement (a new
+  `room.persistRetire` latch) **before** its final drain, which gives the
+  producer two airtight cases and no third one: a send that completed while
+  the latch was open is necessarily seen by the final drain, and otherwise
+  the committing goroutine performs the write itself. The escape hatch that
+  used to drop the update now has a durable destination. `Shutdown` then joins
+  those committer-performed writes — bounded by the caller's ctx, placed after
+  the persistence join and before the relay wind-down so #202's ordering is
+  untouched — because otherwise the usual `srv.Shutdown(ctx)`-then-exit shape
+  would kill the process mid-write, narrowing the loss window rather than
+  closing it. The worker's exit triggers are unchanged, so this cannot
+  introduce the opposite failure — a shutdown that hangs waiting for a producer
+  that never appears. **The guarantee is exactly: given that you stopped
+  accepting new connections first, then — provided `Shutdown` returns
+  `nil` — for every room that was present and had finished loading when
+  `Shutdown` began, any commit whose `Transact` returned before `Shutdown`
+  returned has been handed to the adapter: the write attempt completed and
+  was not abandoned mid-flight.** Whether the adapter *accepted* that write
+  is a separate question this does not answer, and every qualifier here is
+  real. `Shutdown` snapshots the room set once and skips rooms still
+  mid-load, and `ServeHTTP` has no shutdown gate, so a connection accepted
+  during `Shutdown` can create or finish loading a room after that snapshot
+  — one `Shutdown` never waits on (pre-existing; called out here because the
+  sentence would otherwise read as promising against it). A commit that
+  *begins* after `Shutdown` observes its last in-flight write is not covered
+  and cannot be — peer read loops and `*crdt.Doc` holders are producers the
+  server has no way to join. Every wait inside `Shutdown` is bounded by the
+  caller's `ctx`, not by the work actually finishing, so a non-nil return
+  (e.g. `context.DeadlineExceeded`) means even the weaker "handed to the
+  adapter" claim does not hold — a final flush or a stranded write may still
+  have been in flight when the deadline hit. And even on a `nil` return, an
+  adapter error or a recovered panic while storing a commit is logged, not
+  propagated through `Shutdown` — so a `nil` return tells you the write
+  attempt completed without being abandoned, never that the adapter accepted
+  it; a caller who needs that stronger property has to get it from the
+  adapter itself. Three consequences worth knowing rather than
+  discovering: a straggler write is synchronous for its committer and delays
+  that update's relay fan-out (the persistence observer is registered before
+  the relay ones); a caller that retains a `*crdt.Doc` past teardown now keeps
+  writing for a room the server considers gone, where those commits were
+  previously dropped silently; and both widen the window in which `Compact`
+  can overlap a `StoreUpdate` for the same room NAME, which
+  `CompactableAdapter`'s godoc now scopes explicitly (#229).
+- **`provider/websocket`: context-aware adapters lost the shutdown tail on
+  the coalescing-disabled path.** That path handed the worker's
+  **cancellable** ctx — the one a sibling goroutine cancels on `shutdownCh` —
+  to its final drain, so any `PersistenceAdapterContext` implementation
+  (including `persistence/sqlite` via `NewLegacyAdapterContext`) returned
+  `ctx.Err()` and the write was discarded; measured at 51-151 of 200
+  concurrent writes dropped per trial. Both paths' final flushes now use
+  `context.Background()`, and a store aborted by cancellation is **retained**
+  and re-stored on the exit path rather than dropped — the same
+  retain-and-re-flush rule the coalescing path already applied to an
+  unflushed batch. Cancellation still aborts a write already in flight when
+  shutdown begins; it just no longer decides which committed transactions
+  count. Note the trade: because the final flush and the retained re-stores
+  run under `context.Background()`, an adapter that blocks indefinitely now
+  wedges that room's worker at exit, so `Shutdown` can return
+  `context.DeadlineExceeded` where it previously returned `nil` by discarding
+  the data. A second, unrelated cause of the same error: `Shutdown`'s wait
+  covers every committing goroutine, so a sustained writer on a retained
+  `*crdt.Doc` can hold it above zero until the deadline expires with no wedged
+  adapter anywhere (#229).
+- **`provider/client`: three follow-ups from the #165 review rounds
+  (#228).** `Client.Close`, called a second time, always returned `nil`
+  regardless of what the owned store's `Close` actually returned on the
+  first call — `closeErr` was a variable local to `Close`, re-declared fresh
+  (and never touched, since `closeOnce.Do` is a no-op on a repeat call) on
+  every call after the first. It is now cached on the `Client` and returned
+  consistently by every call. `Client.maybeCompact` could lose a concurrent
+  `storeWrites` increment: it read the counter via `Load()` and then reset
+  it unconditionally via `Store(0)`, discarding any `Add(1)` that landed in
+  between (from a concurrent local edit's `onDocUpdate`, incrementing from
+  either the caller's own goroutine or the loop goroutine). It now consumes
+  exactly its threshold via `Add(-threshold)`, which cannot lose a
+  concurrent increment either side of it — impact was compaction cadence
+  drift, never lost data. And `Close`'s teardown closed the WebSocket
+  connection without ever sending a close frame, so the server logged an
+  abnormal closure (1006) for every ordinary, on-purpose disconnect; it now
+  sends `WriteControl(CloseMessage, CloseNormalClosure)` before
+  `conn.Close()`, mirroring every other control frame this package already
+  sends.
+
+### Documentation
+
+- **`docs/ARCHITECTURE.md`: package dependency graph redrawn.** It listed
+  only `provider/{websocket,http}` and omitted five packages shipped between
+  v1.19 and v1.48 — `persistence/`, `cluster/`, `mobile/`,
+  `provider/webhook`, and `provider/client`. Every arrow in the new graph was
+  verified against real imports with `go list` across 14 packages, including
+  the non-obvious one: `awareness/` does **not** import `crdt/`.
+- **`docs/ARCHITECTURE.md`: the "Garbage collection" section documented an
+  API that does not exist.** It told readers to write `doc.GC = true` /
+  `doc.GC = false`; `Doc` has no exported `GC` field, and the flag is set at
+  construction with `crdt.New(crdt.WithGC(false))`. The section also
+  described only the automatic per-transaction pass, omitting two behaviours
+  shipped since: automatic collection is **suspended while any `UndoManager`
+  is registered** (undo re-inserts a copy of the deleted content, so that
+  content must still be present), and `crdt.RunGC` performs tombstone
+  reclamation (#166) — replacing deleted content with `ContentDeleted`
+  tombstones and then merging adjacent tombstones from the same client into
+  single nodes. Its destructive effect on `RestoreDocument` is now stated.
+- **`docs/ARCHITECTURE.md`: "Compatibility testing" described only the
+  fixture layer.** The randomised layer under `testutil/fuzz/` was missing
+  entirely, including `TestFuzzConvergenceMoves` — the oracle that caught the
+  `YArray.Move` divergence fixed in v1.40.0. All four oracles are now listed
+  with what each one proves, which need node, and how to reproduce a failing
+  seed.
+- **`mobile`: the package doc understated the bound surface.** It named only
+  `*Doc` and `*Awareness` as bound pointers, omitting `*SyncClient` and
+  `*Subscription`, and claimed the package never exposes callbacks — it
+  exposes three observer *interfaces* (`DocObserver`, `AwarenessObserver`,
+  `SyncStatusObserver`), which is the only callback form `gomobile bind`
+  supports in that direction. The claim is now precise (no Go **func
+  values**), and `docs/ARCHITECTURE.md`'s `mobile/` section says the same.
+
 ## [1.48.0] — 2026-08-10
 
 ### Added
