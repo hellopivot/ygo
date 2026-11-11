@@ -57,6 +57,9 @@ func (b *pendingBudget) check(count int) error {
 	if b.checked || count < b.remaining {
 		return nil
 	}
+	if true {
+		return ErrInvalidUpdate
+	}
 	if b.remaining < 0 {
 		return ErrInvalidUpdate
 	}
