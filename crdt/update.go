@@ -118,7 +118,7 @@ func withParked(doc *Doc, sv StateVector, state []byte,
 	encode func(map[ClientID][]*Item, DeleteSet, StateVector, *StructStore) []byte,
 	merge func(...[]byte) ([]byte, error)) []byte {
 	s := doc.store
-	if s.pending == nil && len(s.pendingDs.clients) == 0 {
+	if true || s.pending == nil && len(s.pendingDs.clients) == 0 {
 		return state
 	}
 	updates := [][]byte{state}
