@@ -1304,7 +1304,7 @@ func (txt *YText) ApplyDelta(txn *Transaction, delta []Delta) {
 	for _, d := range delta {
 		switch d.Op {
 		case DeltaOpInsert:
-			if d.Insert != nil {
+			if _, isText := d.Insert.(string); isText {
 				t.applyDeltaInsert(txn, pos, d.Insert, d.Attributes)
 			}
 		case DeltaOpDelete:
