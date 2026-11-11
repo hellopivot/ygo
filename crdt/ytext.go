@@ -441,6 +441,12 @@ func (txt *YText) Delete(txn *Transaction, index, length int) {
 // past the deletion, which is enough to cover markers whose scope was
 // changed by this delete. Markers further away are unaffected by this
 // specific deletion.
+//
+// A closer asks for the nearest live same-key marker to its left. The walk
+// answers that from what it has already visited (nearestLiveFormats) instead
+// of walking Left from every closer, which rescanned every marker the walk
+// had just tombstoned: deleting a whole text whose formatting changes on
+// every character was quadratic in the text's length.
 func (txt *YText) cleanupDanglingFormatsInRegion(txn *Transaction, startAnchor *Item) {
 	var node *Item
 	if startAnchor == nil {
@@ -452,6 +458,7 @@ func (txt *YText) cleanupDanglingFormatsInRegion(txn *Transaction, startAnchor *
 	} else {
 		node = startAnchor.Right
 	}
+	nearest := nearestLiveFormats{first: node}
 	seenLivePast := false
 	for node != nil {
 		next := node.Right
@@ -461,26 +468,10 @@ func (txt *YText) cleanupDanglingFormatsInRegion(txn *Transaction, startAnchor *
 		}
 		if cf, ok := node.Content.(*ContentFormat); ok {
 			if cf.Val == nil {
-				// Closer: walk Left until a same-key marker. A tombstoned
-				// marker doesn't count as a live opener.
-				hasLiveOpener := false
-				for p := node.Left; p != nil; p = p.Left {
-					if p.Deleted {
-						continue
-					}
-					pcf, isFmt := p.Content.(*ContentFormat)
-					if !isFmt {
-						continue
-					}
-					if pcf.Key != cf.Key {
-						continue
-					}
-					if pcf.Val != nil {
-						hasLiveOpener = true
-					}
-					break
-				}
-				if !hasLiveOpener {
+				// Closer: redundant unless the nearest live same-key marker
+				// to its left is an opener. A tombstoned marker doesn't
+				// count as a live opener.
+				if left := nearest.leftOf(cf.Key); left == nil || left.Val == nil {
 					node.delete(txn)
 				}
 			} else {
@@ -506,6 +497,9 @@ func (txt *YText) cleanupDanglingFormatsInRegion(txn *Transaction, startAnchor *
 					node.delete(txn)
 				}
 			}
+			if !node.Deleted {
+				nearest.kept(cf)
+			}
 			node = next
 			continue
 		}
@@ -519,6 +513,58 @@ func (txt *YText) cleanupDanglingFormatsInRegion(txn *Transaction, startAnchor *
 		}
 		node = next
 	}
+}
+
+// nearestLiveFormats finds, for cleanupDanglingFormatsInRegion, the nearest
+// live ContentFormat with a given key to the left of the item the walk is on.
+//
+// The walk visits every item from first up to its current item, and only
+// ever tombstones the item it is on, so between first and the current item
+// the answer is the last same-key marker the walk left live. Nothing left of
+// first changes during the walk, so that part is walked once per key and
+// memoised. The result is the marker a Left walk from the current item would
+// stop at.
+type nearestLiveFormats struct {
+	first *Item
+	// walked holds, per key, the last marker the walk visited and left live.
+	walked map[string]*ContentFormat
+	// before holds, per key, the nearest live marker left of first, or nil
+	// when there is none.
+	before map[string]*ContentFormat
+}
+
+// kept records that the walk left cf live at its current item.
+func (n *nearestLiveFormats) kept(cf *ContentFormat) {
+	if n.walked == nil {
+		n.walked = make(map[string]*ContentFormat, 2)
+	}
+	n.walked[cf.Key] = cf
+}
+
+// leftOf returns the nearest live marker with key left of the walk's
+// current item, or nil.
+func (n *nearestLiveFormats) leftOf(key string) *ContentFormat {
+	if cf, ok := n.walked[key]; ok {
+		return cf
+	}
+	if cf, ok := n.before[key]; ok {
+		return cf
+	}
+	var found *ContentFormat
+	for p := n.first.Left; p != nil; p = p.Left {
+		if p.Deleted {
+			continue
+		}
+		if pcf, isFmt := p.Content.(*ContentFormat); isFmt && pcf.Key == key {
+			found = pcf
+			break
+		}
+	}
+	if n.before == nil {
+		n.before = make(map[string]*ContentFormat, 2)
+	}
+	n.before[key] = found
+	return found
 }
 
 // Format applies attrs to the character range [index, index+length).
