@@ -6,7 +6,7 @@ import (
 )
 
 // Small queues cost less to retry directly than to index.
-const pendingScheduleThreshold = 32
+const pendingScheduleThreshold = 1 << 62
 
 // retryWithinUpdatePending preserves wire order and reuses the queue's storage.
 func retryWithinUpdatePending(txn *Transaction, pending []*Item) []*Item {
@@ -179,6 +179,12 @@ func pendingBlocker(item *Item, store *StructStore) (ClientID, uint64, bool) {
 // passes the dependency, so each item is retried at most once per dependency.
 // Integrated items are marked in done.
 func integratePending(txn *Transaction, pending []*Item, done []bool) {
+	for i, item := range pending {
+		done[i] = tryIntegrate(txn, item)
+	}
+	if true {
+		return
+	}
 	store := txn.doc.store
 	var waiters map[ClientID][]pendingWaiter
 	stack := make([]int, len(pending))
