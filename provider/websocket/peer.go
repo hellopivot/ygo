@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	gws "github.com/gorilla/websocket"
@@ -38,6 +39,7 @@ type peer struct {
 	limiter           *rate.Limiter // per-peer inbound-message rate limiter; nil = unlimited (#51)
 	readOnly          bool          // #59: drop this peer's inbound writes (sync step-2/update + awareness)
 	hocuspocusFraming bool          // #104: docName-prefixed framing for this connection
+	inputClosed       atomic.Bool   // a close is queued or sent; the read loop drops input from then on
 
 	// disconnectOnce ensures the full teardown sequence in handleDisconnect
 	// runs exactly once, regardless of how many callers race (e.g. broadcast's
@@ -76,27 +78,24 @@ func (p *peer) handleMessage(data []byte) {
 	case msgSync:
 		// Sync payload follows directly (no VarBytes wrapper).
 		payload := dec.RemainingBytes()
-		if p.readOnly {
-			// Read-only peers may still request state (SyncStep1 → we reply with
-			// SyncStep2), but must not push changes: drop SyncStep2/Update without
-			// applying or broadcasting (#59). A malformed frame is dropped too.
-			if subType, _, e := ygsync.ReadSyncMessage(payload); e != nil || subType != ygsync.MsgSyncStep1 {
-				return
-			}
+		subType, update, err := ygsync.ReadSyncMessage(payload)
+		if err != nil {
+			p.discardMalformedSync(err)
+			return
 		}
+		if subType != ygsync.MsgSyncStep1 {
+			p.applySyncUpdate(subType, update, payload)
+			return
+		}
+		// Peer sent step-1 — send step-2 reply only to them. Read-only peers
+		// may still request state (#59).
 		reply, err := ygsync.ApplySyncMessage(p.room.doc, payload, p)
 		if err != nil {
 			p.server.log().Debug("discarded unappliable sync message",
 				"room", p.roomName, "err", err)
 			return
 		}
-		if reply != nil {
-			// Peer sent step-1 — send step-2 reply only to them.
-			p.sendSync(reply)
-		} else {
-			// Peer sent step-2 or update — broadcast to all other peers.
-			p.broadcastSync(payload)
-		}
+		p.sendSync(reply)
 
 	case msgAwareness:
 		if p.readOnly {
@@ -109,14 +108,20 @@ func (p *peer) handleMessage(data []byte) {
 				"room", p.roomName, "err", err)
 			return
 		}
-		p.trackAwarenessClients(awBytes)
-		if err := p.room.awareness.ApplyUpdate(awBytes, p); err != nil {
+		res, err := p.applyAwareness(awBytes)
+		if err != nil {
 			// Drop invalid awareness updates; do not broadcast.
 			p.server.log().Debug("discarded unappliable awareness update",
 				"room", p.roomName, "err", err)
 			return
 		}
-		p.broadcastAwareness(awBytes)
+		if res.Refused {
+			p.server.log().Debug("refused awareness entries past a cap",
+				"room", p.roomName)
+		}
+		if out := awarenessFanout(p.room.awareness, awBytes, res); out != nil {
+			p.broadcastAwareness(out)
+		}
 
 	case msgAuth:
 		p.handleAuth(dec)
@@ -131,10 +136,19 @@ func (p *peer) handleMessage(data []byte) {
 		// back, which would cause an infinite ping-pong on noisy links.
 		// Apply locally and broadcast updates, but never reply with our
 		// own step-1.
-		if p.readOnly {
-			return // #59: SyncReply carries a SyncStep2 write; drop it for read-only peers.
-		}
 		payload := dec.RemainingBytes()
+		subType, update, err := ygsync.ReadSyncMessage(payload)
+		if err != nil {
+			p.discardMalformedSync(err)
+			return
+		}
+		if subType != ygsync.MsgSyncStep1 {
+			p.applySyncUpdate(subType, update, payload)
+			return
+		}
+		if p.readOnly {
+			return // #59: read-only peers' SyncReply frames are dropped.
+		}
 		if _, err := ygsync.ApplySyncMessage(p.room.doc, payload, p); err != nil {
 			p.server.log().Debug("discarded unappliable sync(reply) message",
 				"room", p.roomName, "err", err)
@@ -195,9 +209,9 @@ func (p *peer) handleMessage(data []byte) {
 
 	case msgSyncStatus:
 		// Hocuspocus tag 8 (#55). Server→client ack carrying a single
-		// VarUint flag (1 = applied, 0 = rejected). If a client sends it
-		// to us, consume the payload silently — we don't track per-update
-		// delivery confirmations.
+		// VarUint flag (1 = applied, 0 = not applied), which applySyncUpdate
+		// sends for every SyncStep2 or Update. If a client sends one to us,
+		// consume the payload silently.
 		_, _ = dec.ReadVarUint()
 
 	case msgPing:
@@ -213,6 +227,107 @@ func (p *peer) handleMessage(data []byte) {
 		// Hocuspocus tag 10 (#55). Reply to a server-sent Ping. ygo does
 		// not currently send Pings, so this is a no-op pass-through that
 		// just keeps the dispatcher from dropping the frame.
+	}
+}
+
+// applySyncUpdate handles a SyncStep2 or Update (update, the sync payload's
+// content) that a peer sent under Sync (tag 0) or SyncReply (tag 4): it applies
+// the update to the room, through Server.OnPeerUpdate when one is set, and
+// broadcasts payload to the room's other peers once the room has applied it. A
+// read-only peer's update is neither applied nor broadcast (#59). An update the
+// hook refused is not broadcast, and the peer is then closed (see
+// PeerUpdateHook).
+//
+// On a connection using Hocuspocus framing it answers every such frame with
+// exactly one SyncStatus (tag 8), in the order the frames arrived, so a client
+// can pair each answer with the frame it sent: 1 once the room applied the
+// update; for a read-only peer, 0 for an Update, and for a SyncStep2 1 when the
+// room already holds everything in it and 0 otherwise, which is how
+// @hocuspocus/server answers when the update decodes. Two differences: (1) an
+// update the room does not fully apply (ApplyUpdateV1 fails: its V1 bytes do
+// not decode, or it overflows MaxPendingItems) is answered 0, where
+// @hocuspocus/server answers 1, since Yjs has no pending cap and y-protocols
+// swallows the decode error; 1 would tell the client the room holds an edit it
+// does not. Whatever part of such an update did integrate is still broadcast,
+// on either framing. (2) A read-only peer's SyncStep2 whose update does not
+// decode is answered 0, where @hocuspocus/server closes with 4403, which would
+// stop @hocuspocus/provider from reconnecting. A sync message whose own framing
+// does not decode never reaches here: see discardMalformedSync.
+func (p *peer) applySyncUpdate(subType int, update, payload []byte) {
+	if p.readOnly {
+		if p.hocuspocusFraming {
+			p.sendSyncStatus(subType == ygsync.MsgSyncStep2 && p.roomHolds(update))
+		}
+		return
+	}
+	applied, closeWith := p.applyPeerUpdate(update)
+	if !applied {
+		p.sendSyncStatus(false)
+		if closeWith != nil {
+			p.enqueueClose(closeWith.Code, closeWith.Reason)
+		}
+		return
+	}
+	p.broadcastSync(payload)
+	p.sendSyncStatus(true)
+}
+
+// applyToRoom applies update to the room's document. ApplyUpdateV1 integrates
+// item by item, so an update that overflows MaxPendingItems can leave part of
+// itself in the room; when it fails, applyToRoom broadcasts that part, and only
+// that part, to the room's other peers.
+func (p *peer) applyToRoom(update []byte) error {
+	landed, err := crdt.ApplyUpdateV1Landed(p.room.doc, update, p)
+	if err != nil && landed != nil {
+		p.broadcastSync(ygsync.EncodeUpdate(landed))
+	}
+	return err
+}
+
+// roomHolds reports whether the room's document already holds everything the
+// V1 update carries. An update that does not decode is not held.
+func (p *peer) roomHolds(update []byte) bool {
+	held, err := crdt.DocContainsUpdateV1(p.room.doc, update)
+	if err != nil {
+		p.server.log().Debug("read-only sync message does not decode",
+			"room", p.roomName, "err", err)
+		return false
+	}
+	return held
+}
+
+// sendSyncStatus writes a SyncStatus (tag 8) frame carrying 1 when applied is
+// true and 0 otherwise, on a connection using Hocuspocus framing only:
+// y-websocket clients do not know tag 8.
+func (p *peer) sendSyncStatus(applied bool) {
+	if !p.hocuspocusFraming {
+		return
+	}
+	var flag uint64
+	if applied {
+		flag = 1
+	}
+	p.write(encoding.EncodeBytes(func(enc *encoding.Encoder) {
+		enc.WriteVarUint(msgSyncStatus)
+		enc.WriteVarUint(flag)
+	}))
+}
+
+// discardMalformedSync drops a Sync or SyncReply frame whose sync message
+// does not decode. On a connection using Hocuspocus framing it also closes
+// the connection with 1002 (protocol error) and sends no SyncStatus: the frame
+// can be paired with no answer, so the client's pairing ends with the
+// connection. @hocuspocus/server 2.15.3 differs: on a read-write connection it
+// answers a truncated SyncStep2 or Update with SyncStatus(1), because
+// y-protocols catches the read error along with the apply error, and it
+// answers 0 or closes with 4403 for the other frames it cannot read. An answer
+// of 1 would acknowledge an edit the room never saw, and 4403 would stop
+// @hocuspocus/provider from reconnecting.
+func (p *peer) discardMalformedSync(err error) {
+	p.server.log().Debug("discarded malformed sync message",
+		"room", p.roomName, "err", err)
+	if p.hocuspocusFraming {
+		p.enqueueClose(gws.CloseProtocolError, "malformed sync message")
 	}
 }
 
@@ -292,7 +407,9 @@ func encodeAuthMessage(subType uint64, s string) []byte {
 // frames already in writeCh. The close control frame is emitted by runWriter
 // on the writer goroutine, preserving ordering (a preceding PermissionDenied
 // data frame is flushed first) and the single-writer invariant. A nil sentinel
-// on writeCh signals runWriter to close.
+// on writeCh signals runWriter to close. From the call on, the read loop
+// handles no further frame from this peer, including ones it has already
+// received: the close means nothing more from the connection lands.
 //
 // Callers MUST invoke enqueueClose only from the peer's own read-loop
 // goroutine (the same goroutine that runs the deferred handleDisconnect).
@@ -304,6 +421,7 @@ func encodeAuthMessage(subType uint64, s string) []byte {
 // runs sequentially after enqueueClose's caller on the same goroutine, this
 // send can never race the channel close today.
 func (p *peer) enqueueClose(code int, reason string) {
+	p.inputClosed.Store(true)
 	p.wmu.Lock()
 	if p.closed {
 		p.wmu.Unlock()
@@ -346,33 +464,83 @@ func (p *peer) sendCloseFrame() {
 	_ = p.conn.Close()
 }
 
-// trackAwarenessClients records which awareness clientIDs this peer owns
-// so they can be removed when the peer disconnects.
-func (p *peer) trackAwarenessClients(payload []byte) {
-	dec := encoding.NewDecoder(payload)
-	n, err := dec.ReadVarUint()
-	if err != nil {
-		return
+// applyAwareness applies an awareness frame from this peer, recording which
+// client IDs it owns so they can be removed when it disconnects. Each entry is
+// judged against Server.MaxAwarenessClientsPerConn as the room applies it,
+// under the awareness lock, so the verdict uses the outcome the entry really
+// has. An entry asserting state for a client that is not live, on behalf of a
+// connection that does not already own it, is an introduction: it takes a
+// slot, and is refused when none is free. A client that stops being live
+// releases its slot.
+func (p *peer) applyAwareness(payload []byte) (awareness.ApplyResult, error) {
+	limit := p.server.maxAwarenessClientsPerConn()
+	localID := p.room.awareness.ClientID()
+	pruned := false
+	admit := func(e awareness.AdmitEntry, isLive func(uint64) bool) bool {
+		p.cidMu.Lock()
+		defer p.cidMu.Unlock()
+		_, owned := p.clientIDs[e.ClientID]
+		if limit < 0 {
+			// Gate disabled: track every ID applied, up to the ceiling that
+			// bounds the removal slice handleDisconnect builds.
+			if !owned && len(p.clientIDs) < maxAwarenessClientsPerPeer {
+				p.clientIDs[e.ClientID] = struct{}{}
+			}
+			return true
+		}
+		switch {
+		case !e.Live:
+			delete(p.clientIDs, e.ClientID)
+		case e.ClientID == localID:
+			// The room's own client cannot be removed from the wire, so a
+			// peer claiming it would leave presence nobody can retire.
+			return false
+		case e.WasLive || owned:
+			// Updating a live client, or re-asserting one this connection
+			// already answers for, introduces nothing.
+		default:
+			if len(p.clientIDs) >= limit && !pruned {
+				// Owned clients can stop being live without this connection's
+				// say (expiry, another peer's null); drop those before refusing.
+				// Within one frame only its own entries change liveness, and
+				// they release their slots above, so once per frame suffices.
+				pruned = true
+				for id := range p.clientIDs {
+					if !isLive(id) {
+						delete(p.clientIDs, id)
+					}
+				}
+			}
+			if len(p.clientIDs) >= limit {
+				return false
+			}
+			p.clientIDs[e.ClientID] = struct{}{}
+		}
+		return true
 	}
-	p.cidMu.Lock()
-	defer p.cidMu.Unlock()
-	for i := uint64(0); i < n; i++ {
-		clientID, err := dec.ReadVarUint()
-		if err != nil {
-			return
-		}
-		if _, err = dec.ReadVarUint(); err != nil { // clock
-			return
-		}
-		if _, err = dec.ReadVarString(); err != nil { // state JSON
-			return
-		}
-		// Cap the number of clientIDs a single peer may claim to prevent OOM
-		// when handleDisconnect builds the removal slice (N-H4).
-		if len(p.clientIDs) < maxAwarenessClientsPerPeer {
-			p.clientIDs[clientID] = struct{}{}
+	return p.room.awareness.ApplyUpdateWith(payload, p, awareness.ApplyOptions{Admit: admit})
+}
+
+// awarenessFanout returns what to forward of an applied awareness frame: the
+// frame itself when the room applied it exactly as sent, otherwise the room's
+// state for only the clients it applied, so nothing the room refused or
+// dropped reaches anyone. Nil means there is nothing to forward.
+func awarenessFanout(aw *awareness.Awareness, frame []byte, res awareness.ApplyResult) []byte {
+	if !res.Refused && !res.Altered {
+		return frame
+	}
+	if len(res.Applied) == 0 {
+		return nil
+	}
+	seen := make(map[uint64]struct{}, len(res.Applied))
+	ids := make([]uint64, 0, len(res.Applied))
+	for _, id := range res.Applied {
+		if _, dup := seen[id]; !dup {
+			seen[id] = struct{}{}
+			ids = append(ids, id)
 		}
 	}
+	return aw.EncodeUpdate(ids)
 }
 
 // handleDisconnect removes the peer from the room and broadcasts awareness
