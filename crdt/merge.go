@@ -175,9 +175,7 @@ func mergeClientStructs(updates []map[ClientID][]*Item) map[ClientID][]*Item {
 		}
 		if curr != nil {
 			take(curr)
-			for next := s.next(); next != nil && next.ID.Client == client && next.ID.Clock == end(write); next = s.next() {
-				take(next)
-			}
+			s.next()
 		}
 		s.taken = taken
 		if s.curr() == nil {
