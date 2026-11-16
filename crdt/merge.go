@@ -1,6 +1,7 @@
 package crdt
 
 import (
+	"container/heap"
 	"sort"
 
 	"github.com/reearth/ygo/encoding"
@@ -80,52 +81,161 @@ func decodeStructsV1(scratch *Doc, update []byte) (map[ClientID][]*Item, DeleteS
 }
 
 // sliceItemFront mutates item to drop its first `offset` logical units, so it
-// starts `offset` clocks later. Used to dedup overlapping struct ranges when
+// starts `offset` clocks later. Used to cut overlapping struct ranges when
 // merging. Content.Splice(offset) mutates the receiver to hold [0,offset) and
 // returns the suffix; we keep the suffix.
 func sliceItemFront(item *Item, offset int) {
-	// An origin-less, parent-less struct (a GC placeholder) must stay so it
-	// re-encodes as a GC struct rather than a normal item; only set Origin for a
-	// real item (one that already has an origin or a resolved parent). Skip
-	// structs never reach here — they're filtered out during decode.
-	hadAnchor := item.Origin != nil || item.Parent != nil
+	// Like Yjs sliceStruct, the cut item follows its own client's previous
+	// clock, whatever anchors it had: one with only a right origin or a parent
+	// by ID (its parent is not resolved yet while merging) must not keep
+	// following those alone. A GC placeholder must stay anchorless so it
+	// re-encodes as a GC struct. Skip structs never reach here — they're
+	// filtered out during decode.
+	isItem := !item.isGCOrphan()
 	suffix := item.Content.Splice(offset)
 	item.ID.Clock += uint64(offset)
-	if hadAnchor {
+	if isItem {
 		item.Origin = &ID{Client: item.ID.Client, Clock: item.ID.Clock - 1}
 	}
 	item.Content = suffix
 }
 
-// dedupClientStructs sorts a client's structs by clock and removes/slices
-// overlaps so the result is non-overlapping and clock-ascending. Clock GAPS are
-// preserved (the encoder emits skip structs for them).
-func dedupClientStructs(items []*Item) []*Item {
-	// Sort by clock, longest-first on ties, so the merge is deterministic when
-	// two inputs carry overlapping ranges starting at the same clock (the longer
-	// struct is kept and shorter duplicates are dropped/sliced consistently).
-	sort.Slice(items, func(i, j int) bool {
-		if items[i].ID.Clock != items[j].ID.Clock {
-			return items[i].ID.Clock < items[j].ID.Clock
-		}
-		return items[i].Content.Len() > items[j].Content.Len()
-	})
-	out := items[:0]
-	var covEnd uint64
-	hasCov := false
-	for _, it := range items {
-		end := it.ID.Clock + uint64(it.Content.Len())
-		if hasCov && end <= covEnd {
-			continue // fully covered by an earlier struct
-		}
-		if hasCov && it.ID.Clock < covEnd {
-			sliceItemFront(it, int(covEnd-it.ID.Clock))
-		}
-		out = append(out, it)
-		covEnd = end
-		hasCov = true
+// mergeClientStructs merges the structs of several decoded updates into
+// per-client, clock-ascending, non-overlapping slices, deciding between
+// overlapping structs of one client the way Yjs mergeUpdatesV2
+// (src/utils/updates.js) does. Clock gaps are preserved (the encoder emits
+// skip structs for them).
+//
+// Yjs reads every update as a stream, clients in descending order and each
+// client's structs by clock, and takes structs by client and clock across
+// the streams. A struct it takes is kept whole, and so is every struct that
+// follows it without a gap in the same stream. A struct of another stream
+// that ends within what it has taken is dropped, and one that reaches past it
+// is cut there. Which of two structs at the same clock it takes first
+// depends on the order of the streams, not on the structs' lengths: the
+// streams stay in the order Yjs's stable sort left them in, where the stream
+// it last took from comes first and the streams it has not taken from keep
+// the order of the updates.
+//
+// So when a document's encoded state is merged with the structs it parks, as
+// withParked does, no parked struct replaces an integrated one: each client's
+// integrated structs run without a gap from the lowest clock any of the
+// updates holds for it, and the state is the first update, while each parked
+// struct is an update of its own. Keeping the longer struct, as this did
+// before, let a parked struct forged for another client's clocks replace that
+// client's integrated characters in the encoding.
+//
+// Two Yjs details are left out. It merges adjacent GC structs of different
+// updates into one, which changes the bytes but not the clocks they cover,
+// and its sort orders a GC struct and an item at the same clock
+// inconsistently; here they keep the order of the streams.
+func mergeClientStructs(updates []map[ClientID][]*Item) map[ClientID][]*Item {
+	if len(updates) == 1 {
+		return updates[0] // Yjs returns a single update as is
 	}
+	out := make(map[ClientID][]*Item)
+	streams := make(structStreams, 0, len(updates))
+	for i, u := range updates {
+		s := &structStream{index: i}
+		clients := clientsSorted(u)
+		for k := len(clients) - 1; k >= 0; k-- {
+			s.structs = append(s.structs, u[clients[k]]...)
+		}
+		if len(s.structs) > 0 {
+			streams = append(streams, s)
+		}
+	}
+	heap.Init(&streams)
+	end := func(it *Item) uint64 { return it.ID.Clock + uint64(it.Content.Len()) }
+	// write is the struct taken last and not yet emitted: Yjs's currWrite.
+	var write *Item
+	take := func(it *Item) {
+		if write != nil {
+			out[write.ID.Client] = append(out[write.ID.Client], write)
+		}
+		write = it
+	}
+	for taken := 1; len(streams) > 0; taken++ {
+		s := streams[0]
+		curr := s.curr()
+		client := curr.ID.Client
+		if write != nil && write.ID.Client == client {
+			dropped := false
+			for curr != nil && curr.ID.Client == client && end(curr) <= end(write) {
+				curr = s.next()
+				dropped = true
+			}
+			switch {
+			case curr == nil || curr.ID.Client != client || (dropped && curr.ID.Clock > end(write)):
+				// Another stream may hold this client's structs below curr.
+				curr = nil
+			case curr.ID.Clock < end(write):
+				sliceItemFront(curr, int(end(write)-curr.ID.Clock))
+			}
+		}
+		if curr != nil {
+			take(curr)
+			for next := s.next(); next != nil && next.ID.Client == client && next.ID.Clock == end(write); next = s.next() {
+				take(next)
+			}
+		}
+		s.taken = taken
+		if s.curr() == nil {
+			heap.Pop(&streams)
+		} else {
+			heap.Fix(&streams, 0)
+		}
+	}
+	take(nil)
 	return out
+}
+
+// structStream is one update's structs in the order Yjs's LazyStructReader
+// yields them.
+type structStream struct {
+	structs []*Item
+	pos     int
+	index   int // the update's position among those merged
+	taken   int // when mergeClientStructs last took from it; 0 if never
+}
+
+func (s *structStream) curr() *Item {
+	if s.pos < len(s.structs) {
+		return s.structs[s.pos]
+	}
+	return nil
+}
+
+func (s *structStream) next() *Item {
+	s.pos++
+	return s.curr()
+}
+
+// structStreams orders streams as Yjs sorts its struct readers: by client,
+// descending, then by clock, with ties left in the order of the previous
+// sort, which puts the stream taken from last first.
+type structStreams []*structStream
+
+func (h structStreams) Len() int { return len(h) }
+func (h structStreams) Less(i, j int) bool {
+	a, b := h[i].curr().ID, h[j].curr().ID
+	switch {
+	case a.Client != b.Client:
+		return a.Client > b.Client
+	case a.Clock != b.Clock:
+		return a.Clock < b.Clock
+	case h[i].taken != h[j].taken:
+		return h[i].taken > h[j].taken
+	}
+	return h[i].index < h[j].index
+}
+func (h structStreams) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+func (h *structStreams) Push(x any)   { *h = append(*h, x.(*structStream)) }
+func (h *structStreams) Pop() any {
+	old := *h
+	s := old[len(old)-1]
+	*h = old[:len(old)-1]
+	return s
 }
 
 // encodeStructStoreV1 encodes per-client struct slices (clock-ordered,
@@ -209,27 +319,25 @@ func encodeStructStoreV1(perClient map[ClientID][]*Item, ds DeleteSet, sv StateV
 }
 
 // buildMergeStore decodes every update into one merged set of per-client struct
-// slices (deduped/sliced, gaps preserved) and the union of their delete sets,
-// plus a StructStore holding every struct for origin look-ups during encode.
+// slices (overlaps cut as Yjs does, gaps preserved) and the union of their
+// delete sets, plus a StructStore holding every struct for origin look-ups
+// during encode.
 func buildMergeStore(updates [][]byte, decode func(*Doc, []byte) (map[ClientID][]*Item, DeleteSet, error)) (map[ClientID][]*Item, DeleteSet, *StructStore, error) {
 	scratch := New()
-	perClient := make(map[ClientID][]*Item)
+	decoded := make([]map[ClientID][]*Item, 0, len(updates))
 	mergedDS := newDeleteSet()
 	for _, u := range updates {
 		structs, ds, err := decode(scratch, u)
 		if err != nil {
 			return nil, DeleteSet{}, nil, err
 		}
-		for c, items := range structs {
-			perClient[c] = append(perClient[c], items...)
-		}
+		decoded = append(decoded, structs)
 		mergedDS.Merge(ds)
 	}
+	perClient := mergeClientStructs(decoded)
 	store := &StructStore{clients: make(map[ClientID][]*Item, len(perClient))}
 	for c, items := range perClient {
-		deduped := dedupClientStructs(items)
-		perClient[c] = deduped
-		store.clients[c] = deduped
+		store.clients[c] = items
 	}
 	resolveParents(store)
 	return perClient, mergedDS, store, nil

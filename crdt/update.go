@@ -123,7 +123,9 @@ func withParked(doc *Doc, sv StateVector, state []byte,
 	}
 	updates := [][]byte{state}
 	if s.pending != nil {
-		// One update per item: parked items may overlap, and merge dedups.
+		// One update per item: parked items may overlap each other and the
+		// integrated structs, and the merge keeps the state's structs whole
+		// over them, as Yjs's mergeUpdatesV2 does.
 		for _, it := range s.pending.items {
 			updates = append(updates, encode(map[ClientID][]*Item{it.ID.Client: {it}}, newDeleteSet(), sv, s))
 		}
