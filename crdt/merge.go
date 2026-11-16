@@ -106,24 +106,38 @@ func sliceItemFront(item *Item, offset int) {
 // (src/utils/updates.js) does. Clock gaps are preserved (the encoder emits
 // skip structs for them).
 //
-// Yjs reads every update as a stream, clients in descending order and each
-// client's structs by clock, and takes structs by client and clock across
-// the streams. A struct it takes is kept whole, and so is every struct that
-// follows it without a gap in the same stream. A struct of another stream
-// that ends within what it has taken is dropped, and one that reaches past it
-// is cut there. Which of two structs at the same clock it takes first
-// depends on the order of the streams, not on the structs' lengths: the
-// streams stay in the order Yjs's stable sort left them in, where the stream
-// it last took from comes first and the streams it has not taken from keep
-// the order of the updates.
+// Yjs reads every update as a stream, its clients in the order the update's
+// bytes list them and each client's structs by clock, and takes structs by
+// client, descending, and clock across the streams. A struct it takes is kept
+// whole, and so is every struct that follows it without a gap in the same
+// stream. A struct of another stream that ends within what it has taken is
+// dropped, and one that reaches past it is cut there. Which of two structs at
+// the same clock it takes first depends on the order of the streams, not on
+// the structs' lengths: the streams stay in the order Yjs's stable sort left
+// them in, where the stream it last took from comes first and the streams it
+// has not taken from keep the order of the updates.
 //
 // So when a document's encoded state is merged with the structs it parks, as
 // withParked does, no parked struct replaces an integrated one: each client's
 // integrated structs run without a gap from the lowest clock any of the
 // updates holds for it, and the state is the first update, while each parked
-// struct is an update of its own. Keeping the longer struct, as this did
-// before, let a parked struct forged for another client's clocks replace that
-// client's integrated characters in the encoding.
+// struct is an update of its own. That matters because a parked struct can be
+// forged for another client's clocks: it must not replace that client's
+// integrated characters in the encoding.
+//
+// Yjs's loop relies on every update listing its clients in descending order,
+// as Yjs's encoders write them. A decoded update here keeps no order of
+// clients, so each stream lists them in descending order, whatever order the
+// update's bytes used. ygo's V2 encoder writes clients in descending order as
+// well, but its V1 encoder writes them in ascending order. For ygo's own V1
+// updates with more than one client, MergeUpdatesV1 therefore gives what Yjs
+// mergeUpdates gives for the same structs listed in descending order, not
+// what it gives for the bytes ygo wrote: given clients in ascending order,
+// Yjs can take the other of two structs at one clock, and can drop a higher
+// client's structs. Merging ygo's V1 update of client 1's "Hello" and client
+// 2's "zz" with client 1's "Hi", Yjs mergeUpdates drops "zz", while
+// MergeUpdatesV1 keeps "Hello" and "zz", as Yjs does when that update lists
+// client 2 first.
 //
 // Two Yjs details are left out. It merges adjacent GC structs of different
 // updates into one, which changes the bytes but not the clocks they cover,
@@ -137,6 +151,7 @@ func mergeClientStructs(updates []map[ClientID][]*Item) map[ClientID][]*Item {
 	streams := make(structStreams, 0, len(updates))
 	for i, u := range updates {
 		s := &structStream{index: i}
+		// Clients in descending order, whatever order the bytes used.
 		clients := clientsSorted(u)
 		for k := len(clients) - 1; k >= 0; k-- {
 			s.structs = append(s.structs, u[clients[k]]...)
