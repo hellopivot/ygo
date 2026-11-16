@@ -12,9 +12,7 @@ import (
 // the clocks it lacks. The decoder must park what follows the skip until those
 // clocks arrive, as Yjs does, instead of moving the client's clock past the
 // gap: that renumbered the parked structs into the gap and discarded the
-// update that later filled it (reearth/ygo#251). This branch takes only that
-// decoder half of reearth/ygo#257; the encoder still leaves parked structs
-// out, so what a document stores is unchanged.
+// update that later filled it (reearth/ygo#251).
 
 type skipDecodeFormat struct {
 	name   string
@@ -103,10 +101,12 @@ func TestUnit_SkipDecode_GappedMergeThenFiller(t *testing.T) {
 	}
 }
 
-// The encoder is unchanged: a document holding structs parked behind a skip
-// encodes only what it integrated, so a reader of what it stores sees the same
-// content it showed, and the filler still integrates later.
-func TestUnit_SkipDecode_EncoderStillLeavesParkedStructsOut(t *testing.T) {
+// From v1.55.0 the encoder writes parked structs too (reearth/ygo#257): a
+// document holding a struct parked behind a skip encodes it behind the same
+// skip, a reader parks it again, and the filler still completes the document.
+// (On the fork's decoder-only patch, fc0ddac, this test asserted the opposite:
+// that encoder still left parked structs out.)
+func TestUnit_SkipDecode_EncoderKeepsParkedStructs(t *testing.T) {
 	for _, f := range skipDecodeFormats {
 		t.Run(f.name, func(t *testing.T) {
 			ups := skipDecodeTextSteps(t, f)
@@ -116,14 +116,12 @@ func TestUnit_SkipDecode_EncoderStillLeavesParkedStructsOut(t *testing.T) {
 			d := skipDecodeApply(t, f, gapped)
 			require.NotNil(t, d.store.pending, "the struct after the skip must be parked")
 			stored := f.encode(d, nil)
-			require.Equal(t, f.encode(skipDecodeApply(t, f, ups[0]), nil), stored,
-				"the encoding must hold exactly the integrated prefix, without parked structs")
 
 			reread := skipDecodeApply(t, f, stored)
 			require.Equal(t, "ab", skipDecodeText(reread))
-			require.Nil(t, reread.store.pending)
-			require.Equal(t, "abcd", skipDecodeText(skipDecodeApply(t, f, stored, ups[1])),
-				"the filler must still integrate into what was stored")
+			require.NotNil(t, reread.store.pending, "the stored document must carry the parked struct")
+			require.Equal(t, "Xabcd", skipDecodeText(skipDecodeApply(t, f, stored, ups[1])),
+				"the filler must complete what was stored")
 		})
 	}
 }
