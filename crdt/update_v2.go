@@ -138,7 +138,10 @@ type v2Decoder struct {
 	lenDec        anycodec.UintOptRleDecoder
 	restDec       *encoding.Decoder
 
-	keys      []string
+	keys []string
+	// keyBudget is how many bytes key back-references may still add to the
+	// update (see readKey). It starts at the update's own length.
+	keyBudget int
 	dsCurrVal uint64
 }
 
@@ -216,6 +219,7 @@ func newV2Decoder(data []byte) (*v2Decoder, error) {
 		typeRefDec:    anycodec.NewUintOptRleDecoder(typeRefBytes),
 		lenDec:        anycodec.NewUintOptRleDecoder(lenBytes),
 		restDec:       encoding.NewDecoder(remaining),
+		keyBudget:     len(data),
 	}, nil
 }
 
@@ -290,7 +294,17 @@ func (d *v2Decoder) readKey() (string, error) {
 		return "", ErrInvalidUpdate
 	}
 	if idx < len(d.keys) {
-		return d.keys[idx], nil
+		// A back-reference: no Yjs, yrs or ygo encoder writes one (writeKey),
+		// and every encoder writes the key in full again for this struct, so
+		// the stored document grows by len(key) bytes the update never carried.
+		// Refuse once those bytes would pass the update's own length, before
+		// the document is integrated and re-encoded.
+		key := d.keys[idx]
+		d.keyBudget -= len(key)
+		if d.keyBudget < 0 {
+			return "", ErrInvalidUpdate
+		}
+		return key, nil
 	}
 	key, err := d.stringDec.Read()
 	if err != nil {
